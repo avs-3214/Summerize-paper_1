@@ -1,6 +1,9 @@
 """
 POST /summarize       — generate (or serve from cache) a tiered summary
 GET  /summarize/{id}  — retrieve a cached summary only (never calls Groq)
+
+Changes from v1:
+  - generate_summary is now async — awaited here instead of called directly
 """
 
 from datetime import datetime, timezone
@@ -12,9 +15,6 @@ from app.models.schema import SummarizeRequest, SummarizeResponse, Tier
 router = APIRouter()
 
 
-# ---------------------------------------------------------------------------
-# POST /summarize
-
 @router.post(
     "/summarize",
     response_model=SummarizeResponse,
@@ -23,8 +23,8 @@ router = APIRouter()
     description=(
         "Checks SQLite cache first. If a summary already exists for this "
         "paper+tier combination, returns it immediately (from_cache=true) "
-        "without calling Groq. Otherwise, retrieves relevant chunks from "
-        "ChromaDB and calls Groq to generate a new summary."
+        "without calling Groq. Otherwise retrieves relevant chunks from "
+        "ChromaDB, reranks them, and calls Groq to generate a new summary."
     ),
     responses={
         404: {"description": "paper_id not found"},
@@ -34,19 +34,6 @@ router = APIRouter()
     },
 )
 async def create_summary(body: SummarizeRequest) -> SummarizeResponse:
-    """
-    Pipeline:
-      1. Validate paper_id exists in SQLite
-      2. Check cache — if hit, return immediately
-      3. Retrieve chunks from ChromaDB (tier-aware)  → services/retriever.py
-      4. Call Groq with tier-specific prompt          → services/llm.py
-      5. Cache result in SQLite
-      6. Return SummarizeResponse
-    """
-
-    # ------------------------------------------------------------------
-    # 1. Check paper exists
-
     try:
         from app.db.sqlite import get_paper, get_cached_summary, cache_summary
     except ImportError as exc:
@@ -55,19 +42,15 @@ async def create_summary(body: SummarizeRequest) -> SummarizeResponse:
             detail={"error": "internal_error", "detail": "DB layer not yet initialised."},
         ) from exc
 
+    # 1. Paper exists?
     paper = get_paper(body.paper_id)
     if paper is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error": "paper_not_found",
-                "detail": f"No paper found with id {body.paper_id}",
-            },
+            detail={"error": "paper_not_found", "detail": f"No paper found with id {body.paper_id}"},
         )
 
-    # ------------------------------------------------------------------
-    # 2. Cache check
-
+    # 2. Cache hit?
     cached = get_cached_summary(paper_id=body.paper_id, tier=body.tier.value)
     if cached:
         return SummarizeResponse(
@@ -78,42 +61,31 @@ async def create_summary(body: SummarizeRequest) -> SummarizeResponse:
             created_at=cached["created_at"],
         )
 
-    # ------------------------------------------------------------------
-    # 3–4. Retrieve chunks + call Groq
-
+    # 3. Retrieve + generate (both async)
     try:
         from app.services.retriever import retrieve_chunks
         from app.services.llm import generate_summary
 
         chunks = retrieve_chunks(paper_id=body.paper_id, tier=body.tier.value)
-        summary_markdown = generate_summary(chunks=chunks, tier=body.tier.value)
+        summary_markdown = await generate_summary(chunks=chunks, tier=body.tier.value)
 
     except NotImplementedError:
-        # P2/P3 services not yet implemented — return placeholder so
-        # P4 can work on the frontend against this response shape.
         summary_markdown = (
             f"## [{body.tier.value.capitalize()} Summary — stub]\n\n"
-            "This is a placeholder. P2 and P3 have not yet implemented "
-            "the retriever and LLM service.\n\n"
+            "P2 and P3 have not yet implemented the retriever and LLM service.\n\n"
             "- **Tier:** " + body.tier.value + "\n"
             "- **Paper ID:** " + body.paper_id
         )
-
     except HTTPException:
-        # Re-raise 429s from the LLM layer unchanged
         raise
-
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"error": "llm_error", "detail": f"Summary generation failed: {exc}"},
         ) from exc
 
-    # ------------------------------------------------------------------
-    # 5. Cache the new summary
-
+    # 4. Cache result (best-effort)
     now = datetime.now(timezone.utc)
-
     try:
         cache_summary(
             paper_id=body.paper_id,
@@ -122,11 +94,7 @@ async def create_summary(body: SummarizeRequest) -> SummarizeResponse:
             created_at=now,
         )
     except Exception:
-        # Caching is best-effort — don't fail the request if it errors
         pass
-
-    # ------------------------------------------------------------------
-    # 6. Return
 
     return SummarizeResponse(
         paper_id=body.paper_id,
@@ -137,18 +105,11 @@ async def create_summary(body: SummarizeRequest) -> SummarizeResponse:
     )
 
 
-# ---------------------------------------------------------------------------
-# GET /summarize/{paper_id}?tier=...
-
 @router.get(
     "/summarize/{paper_id}",
     response_model=SummarizeResponse,
     status_code=status.HTTP_200_OK,
     summary="Retrieve a cached summary (never calls Groq)",
-    description=(
-        "Cache-only lookup. Returns 404 if no summary has been generated "
-        "yet for this paper+tier. Use POST /summarize to generate first."
-    ),
     responses={
         404: {"description": "Paper not found or no cached summary for this tier"},
         422: {"description": "Invalid tier query param"},
@@ -158,10 +119,6 @@ async def get_summary(
     paper_id: str,
     tier: Tier = Query(..., description="beginner | intermediate | expert"),
 ) -> SummarizeResponse:
-    """
-    Cache-only — never triggers generation or calls Groq.
-    """
-
     try:
         from app.db.sqlite import get_paper, get_cached_summary
     except ImportError as exc:
@@ -170,28 +127,20 @@ async def get_summary(
             detail={"error": "internal_error", "detail": "DB layer not yet initialised."},
         ) from exc
 
-    # Check paper exists
     paper = get_paper(paper_id)
     if paper is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error": "paper_not_found",
-                "detail": f"No paper found with id {paper_id}",
-            },
+            detail={"error": "paper_not_found", "detail": f"No paper found with id {paper_id}"},
         )
 
-    # Check cached summary exists
     cached = get_cached_summary(paper_id=paper_id, tier=tier.value)
     if cached is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
-                "error": "summary_not_found",
-                "detail": (
-                    f"No cached {tier.value} summary for paper {paper_id}. "
-                    "Call POST /summarize to generate one."
-                ),
+                "error":  "summary_not_found",
+                "detail": f"No cached {tier.value} summary for paper {paper_id}. Call POST /summarize to generate one.",
             },
         )
 
@@ -199,6 +148,6 @@ async def get_summary(
         paper_id=paper_id,
         tier=tier,
         summary_markdown=cached["summary_markdown"],
-        from_cache=True,  # GET always returns from_cache=True
+        from_cache=True,
         created_at=cached["created_at"],
     )
