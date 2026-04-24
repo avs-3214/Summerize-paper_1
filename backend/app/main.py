@@ -7,6 +7,10 @@ Run from inside backend/ with:
 
 from contextlib import asynccontextmanager
 
+# Load .env into os.environ FIRST — before any service module reads os.getenv()
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -53,7 +57,7 @@ app = FastAPI(
         "Ingest academic PDFs and generate beginner / intermediate / expert "
         "summaries via Groq (Llama 3.1 8B + Llama 3.3 70B)."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
