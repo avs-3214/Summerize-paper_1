@@ -61,6 +61,14 @@ async function apiGenerate(paperId, tier) {
   return res.json();
 }
 
+// Step 3 — GET /history  (last 5 uploaded papers with cached summaries)
+// Returns: { papers: [{ paper_id, title, num_chunks, uploaded_at, summaries }] }
+async function apiHistory() {
+  const res = await fetch(`${API_BASE}/history?limit=5`);
+  if (!res.ok) return { papers: [] };  // fail silently — history is non-critical
+  return res.json();
+}
+
 // ── Tiers ─────────────────────────────────────────────────────────────────────
 const TIERS = [
   { id: "beginner",     label: "Beginner",     dot: "#2d7a4f", desc: "Plain-language overview" },
@@ -116,6 +124,43 @@ function Spinner() {
 // ── Main ──────────────────────────────────────────────────────────────────────
 export default function Vectara() {
   useEffect(() => { injectFonts(); }, []);
+
+  // ── Seed history from backend on mount ──────────────────────────────────────
+  useEffect(() => {
+    apiHistory().then(({ papers }) => {
+      if (!papers?.length) return;
+      // Normalise backend shape → same shape as in-session entries
+      // Backend: { paper_id, title, num_chunks, uploaded_at, summaries: { beginner, intermediate, expert } }
+      // In-session: { doc: { paper_id, title, num_chunks }, tier, summary: { summary_markdown, from_cache, created_at } }
+      const entries = papers.flatMap(p => {
+        // For each paper, create one entry per tier that has a cached summary
+        const tiers = ["beginner", "intermediate", "expert"];
+        const found = tiers
+          .filter(t => p.summaries[t] !== null)
+          .map(t => ({
+            doc:     { paper_id: p.paper_id, title: p.title, num_chunks: p.num_chunks },
+            tier:    t,
+            summary: {
+              summary_markdown: p.summaries[t],
+              from_cache:       true,
+              created_at:       p.uploaded_at,
+            },
+            fromBackend: true,
+          }));
+        // If no summaries yet, still show the paper so user can generate one
+        if (found.length === 0) {
+          return [{
+            doc:     { paper_id: p.paper_id, title: p.title, num_chunks: p.num_chunks },
+            tier:    null,
+            summary: null,
+            fromBackend: true,
+          }];
+        }
+        return found;
+      });
+      setHistory(entries.slice(0, 5));
+    });
+  }, []);
 
   // ── State machine: idle → uploading → tier_select → summarising → done
   const [stage, setStage]           = useState("idle");      // idle | uploading | tier_select | summarising | done
@@ -208,11 +253,20 @@ export default function Vectara() {
   const loadHistory = (idx) => {
     const entry = history[idx];
     setUploadedDoc(entry.doc);
-    setSelectedTier(entry.tier);
-    setSummary(entry.summary);
     setActiveIdx(idx);
-    setStage("done");
-    setShowSummary(true);
+
+    if (entry.summary) {
+      // Has a cached summary — show it directly
+      setSelectedTier(entry.tier);
+      setSummary(entry.summary);
+      setStage("done");
+      setShowSummary(true);
+    } else {
+      // Paper exists but no summary yet — go to tier select so user can generate
+      setSelectedTier("intermediate");
+      setSummary(null);
+      setStage("tier_select");
+    }
   };
 
   // ── Reset to upload another ───────────────────────────────────────────────
@@ -336,14 +390,15 @@ export default function Vectara() {
                   transition: "all .15s",
                 }}>
                   <div style={{ fontSize: 12, color: "#1a1714", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontWeight: 500 }}>
-                    {entry.doc.title || entry.doc.filename || "Document"}
+                    {entry.doc?.title || entry.doc?.filename || "Document"}
                   </div>
                   <div style={{ fontSize: 11, color: "#9a9183", marginTop: 2, fontFamily: "JetBrains Mono, monospace", display: "flex", gap: 8, alignItems: "center" }}>
-                    <span style={{ color: "#8b5e2a" }}>{entry.doc.num_chunks} chunks</span>
-                    {tm && <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <span style={{ color: "#8b5e2a" }}>{entry.doc?.num_chunks} chunks</span>
+                    {tm && entry.tier && <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
                       <span style={{ width: 6, height: 6, borderRadius: "50%", background: tm.dot, display: "inline-block" }} />
                       {tm.label}
                     </span>}
+                    {!entry.tier && <span style={{ color: "#9a9183" }}>no summary yet</span>}
                     {entry.summary?.from_cache && <span style={{ color: "#2d7a4f" }}>cached</span>}
                   </div>
                 </div>
