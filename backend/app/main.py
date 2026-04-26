@@ -14,8 +14,7 @@ load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-from app.routes import upload, summarize, history, query
+from app.routes import upload, summarize, history, query,validate
 
 
 class Settings(BaseSettings):
@@ -73,6 +72,7 @@ app.add_middleware(
 
 app.include_router(upload.router,    tags=["upload"])
 app.include_router(summarize.router, tags=["summarize"])
+app.include_router(validate.router, tags=["validate"])
 app.include_router(history.router,   tags=["history"])
 app.include_router(query.router,     tags=["query"])
 

@@ -50,6 +50,56 @@ class RateLimitErrorResponse(ErrorResponse):
 
 
 # ---------------------------------------------------------------------------
+# Validation schemas
+
+class ValidationRequest(BaseModel):
+    """Request body for POST /validate."""
+
+    paper_id: str = Field(
+        ...,
+        json_schema_extra={"example": "3fa85f64-5717-4562-b3fc-2c963f66afa6"},
+    )
+    tier: Tier = Field(
+        ...,
+        json_schema_extra={"example": "intermediate"},
+    )
+
+
+class ValidationResponse(BaseModel):
+    """Response body for POST /validate."""
+
+    paper_id: str  = Field(..., json_schema_extra={"example": "3fa85f64-5717-4562-b3fc-2c963f66afa6"})
+    tier:     Tier = Field(..., json_schema_extra={"example": "intermediate"})
+
+    # Metric 1: BERTScore F1 vs abstract
+    bertscore_f1: float = Field(
+        ...,
+        description="BERTScore F1 — semantic similarity between summary and abstract",
+        json_schema_extra={"example": 0.8712},
+    )
+
+    # Metric 2: Cosine similarity vs full paper
+    fullpaper_similarity: float = Field(
+        ...,
+        description="Cosine similarity between summary embedding and mean-pooled paper chunk embeddings",
+        json_schema_extra={"example": 0.6834},
+    )
+
+    # Thresholds used
+    thresholds: dict[str, float] = Field(
+        ...,
+        json_schema_extra={"example": {"bertscore": 0.84, "cosine_sim": 0.65}},
+    )
+
+    # Per-metric pass/fail
+    metric_pass: dict[str, bool] = Field(
+        ...,
+        json_schema_extra={"example": {"bertscore": True, "cosine_sim": True}},
+    )
+
+    overall_valid: bool = Field(..., json_schema_extra={"example": True})
+    verdict:       str  = Field(..., json_schema_extra={"example": " Summary is VALID for tier: INTERMEDIATE"})
+    validated_at:  datetime = Field(..., json_schema_extra={"example": "2024-01-15T10:30:00Z"})
 # Query
 
 class QueryRequest(BaseModel):

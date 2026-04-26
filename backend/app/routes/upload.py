@@ -6,7 +6,7 @@ Changes from v1:
   - Passes rich chunk dicts to embed_chunks() so section tags are stored in ChromaDB
   - Stores sections count in metadata for debugging
 """
-
+#this is upload.py
 import uuid
 from pathlib import Path
 
