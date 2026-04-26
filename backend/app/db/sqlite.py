@@ -9,8 +9,12 @@ Functions:
   - cache_summary()
   - get_cached_validation()
   - cache_validation()
+  - get_cached_query()
+  - cache_query_result()
+  - get_recent_papers()
 """
 
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -21,7 +25,6 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # Engine + session
 
 SQLITE_DB = os.getenv("SQLITE_DB", "../data/sqlite/papers.db")
-
 os.makedirs(os.path.dirname(os.path.abspath(SQLITE_DB)), exist_ok=True)
 
 engine = create_engine(
@@ -55,14 +58,30 @@ class Summary(Base):
     created_at       = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class QueryCache(Base):
+    """
+    Caches query answers keyed by (paper_id, question_hash, tier).
+    question_hash = sha256(question.strip().lower() + tier)
+    """
+    __tablename__ = "query_cache"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    paper_id        = Column(String,  index=True, nullable=False)
+    question_hash   = Column(String,  nullable=False)
+    question        = Column(Text,    nullable=False)
+    tier            = Column(String,  nullable=False)
+    answer_markdown = Column(Text,    nullable=False)
+    created_at      = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class ValidationScore(Base):
     __tablename__ = "validation_scores"
 
     id                   = Column(Integer, primary_key=True, autoincrement=True)
     paper_id             = Column(String,  index=True, nullable=False)
     tier                 = Column(String,  nullable=False)
-    bertscore_f1         = Column(Float,   nullable=False)   # vs abstract
-    fullpaper_similarity = Column(Float,   nullable=False)   # vs full paper (cosine)
+    bertscore_f1         = Column(Float,   nullable=False)
+    fullpaper_similarity = Column(Float,   nullable=False)
     thresholds           = Column(Text,    nullable=False)   # JSON blob
     metric_pass          = Column(Text,    nullable=False)   # JSON blob
     overall_valid        = Column(Boolean, nullable=False)
@@ -71,7 +90,7 @@ class ValidationScore(Base):
 
 
 # ---------------------------------------------------------------------------
-# init_db — picks up ALL 3 models automatically
+# init_db — picks up ALL 4 models automatically
 
 def init_db():
     """Create all tables if they don't already exist."""
@@ -130,13 +149,65 @@ def cache_summary(paper_id: str, tier: str, summary_markdown: str, created_at: d
         db.query(Summary).filter(
             Summary.paper_id == paper_id, Summary.tier == tier
         ).delete()
-        summary = Summary(
+        db.add(Summary(
             paper_id=paper_id,
             tier=tier,
             summary_markdown=summary_markdown,
             created_at=created_at,
+        ))
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Query cache CRUD
+
+def _question_hash(question: str, tier: str) -> str:
+    raw = (question.strip().lower() + "|" + tier).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def get_cached_query(paper_id: str, question: str, tier: str) -> dict | None:
+    qhash = _question_hash(question, tier)
+    with SessionLocal() as db:
+        row = (
+            db.query(QueryCache)
+            .filter(
+                QueryCache.paper_id      == paper_id,
+                QueryCache.question_hash == qhash,
+                QueryCache.tier          == tier,
+            )
+            .first()
         )
-        db.add(summary)
+        if row is None:
+            return None
+        return {
+            "answer_markdown": row.answer_markdown,
+            "created_at":      row.created_at,
+        }
+
+
+def cache_query_result(
+    paper_id: str,
+    question: str,
+    tier: str,
+    answer_markdown: str,
+    created_at: datetime,
+):
+    qhash = _question_hash(question, tier)
+    with SessionLocal() as db:
+        db.query(QueryCache).filter(
+            QueryCache.paper_id      == paper_id,
+            QueryCache.question_hash == qhash,
+            QueryCache.tier          == tier,
+        ).delete()
+        db.add(QueryCache(
+            paper_id=paper_id,
+            question_hash=qhash,
+            question=question,
+            tier=tier,
+            answer_markdown=answer_markdown,
+            created_at=created_at,
+        ))
         db.commit()
 
 
@@ -144,10 +215,6 @@ def cache_summary(paper_id: str, tier: str, summary_markdown: str, created_at: d
 # Validation cache CRUD
 
 def get_cached_validation(paper_id: str, tier: str) -> dict | None:
-    """
-    Retrieve cached validation scores for a paper+tier.
-    Returns dict matching ValidationResponse fields, or None if not cached.
-    """
     with SessionLocal() as db:
         row = (
             db.query(ValidationScore)
@@ -159,7 +226,6 @@ def get_cached_validation(paper_id: str, tier: str) -> dict | None:
         )
         if row is None:
             return None
-
         return {
             "paper_id":             row.paper_id,
             "tier":                 row.tier,
@@ -176,19 +242,15 @@ def get_cached_validation(paper_id: str, tier: str) -> dict | None:
 def cache_validation(
     paper_id: str,
     tier: str,
-    result,               # ValidationResponse pydantic object
+    result,
     validated_at: datetime,
 ) -> None:
-    """
-    Cache validation scores. Upsert pattern — same as cache_summary.
-    """
     with SessionLocal() as db:
         db.query(ValidationScore).filter(
             ValidationScore.paper_id == paper_id,
             ValidationScore.tier     == tier,
         ).delete()
-
-        score = ValidationScore(
+        db.add(ValidationScore(
             paper_id             = paper_id,
             tier                 = tier,
             bertscore_f1         = result.bertscore_f1,
@@ -198,6 +260,38 @@ def cache_validation(
             overall_valid        = result.overall_valid,
             verdict              = result.verdict,
             validated_at         = validated_at,
-        )
-        db.add(score)
+        ))
         db.commit()
+
+
+# ---------------------------------------------------------------------------
+# History
+
+def get_recent_papers(limit: int = 10) -> list[dict]:
+    """Return the last `limit` uploaded papers with their cached summaries."""
+    with SessionLocal() as db:
+        papers = (
+            db.query(Paper)
+            .order_by(Paper.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        result = []
+        for paper in papers:
+            summary_rows = (
+                db.query(Summary)
+                .filter(Summary.paper_id == paper.paper_id)
+                .all()
+            )
+            summaries = {"beginner": None, "intermediate": None, "expert": None}
+            for s in summary_rows:
+                if s.tier in summaries:
+                    summaries[s.tier] = s.summary_markdown
+            result.append({
+                "paper_id":    paper.paper_id,
+                "title":       paper.title,
+                "num_chunks":  paper.num_chunks,
+                "uploaded_at": paper.created_at,
+                "summaries":   summaries,
+            })
+        return result
