@@ -5,23 +5,9 @@ Models:
   beginner:     llama-3.1-8b-instant    (128k context, 8k max output)
   intermediate: llama-3.3-70b-versatile (128k context, 32k max output)
   expert:       llama-3.3-70b-versatile (128k context, 32k max output)
-
-Token budget reasoning:
-  beginner:     400  out (~300 words)  — 250 word target, small buffer fine
-  intermediate: 1500 out (~1100 words) — 5 sections × 3-4 sentences each needs
-                                         room; 900 caused cut-off on last sections
-  expert:       3500 out (~2600 words) — 7 technical sections + reduce step in
-                                         map-reduce needs headroom; 2200 cut off
-                                         Experimental Setup and Limitations consistently
-  map step:     300  out per chunk     — 3-5 sentences, fits comfortably
-
-Rate limit handling:
-  Uses tenacity AsyncRetrying on 429s with exponential backoff (3 attempts).
-  Raises HTTPException(429) with retry_after if all retries exhausted.
 """
 
 from __future__ import annotations
-
 import asyncio
 import os
 
@@ -35,10 +21,9 @@ from tenacity import (
 )
 
 # ---------------------------------------------------------------------------
-# Async client (singleton)
+# Async client
 
 _async_client: AsyncGroq | None = None
-
 
 def _get_async_client() -> AsyncGroq:
     global _async_client
@@ -63,10 +48,24 @@ TIER_MODEL = {
 }
 
 TIER_MAX_TOKENS = {
-    "beginner":     400,    # ~300 words out — 250 word target, fine
-    "intermediate": 1500,   # ~1100 words out — 5 sections need room, was 900 (cut off)
-    "expert":       3500,   # ~2600 words out — 7 sections + map-reduce reduce step
-    "_map_step":    300,    # per-chunk mini summary in expert map phase
+    "beginner":     400,
+    "intermediate": 1500,
+    "expert":       3500,
+    "_map_step":    300,
+}
+
+# Query-specific token budgets — answers are focused, not full summaries
+QUERY_MAX_TOKENS = {
+    "beginner":     350,   # plain-language answer, ~250 words
+    "intermediate": 700,   # structured answer with some detail, ~500 words
+    "expert":       1200,  # technical deep-dive answer, ~900 words
+}
+
+# How many chunks to retrieve per tier for query mode
+QUERY_TOP_K = {
+    "beginner":     3,
+    "intermediate": 5,
+    "expert":       8,
 }
 
 SYSTEM_PROMPT = (
@@ -79,7 +78,7 @@ SYSTEM_PROMPT = (
 
 
 # ---------------------------------------------------------------------------
-# Prompts — with few-shot examples
+# Summary prompts
 
 _BEGINNER_EXAMPLE = """\
 Example of a good beginner summary (for a paper on neural translation):
@@ -195,15 +194,62 @@ Write the expert summary now:"""
 
 
 # ---------------------------------------------------------------------------
-# Async Groq call with tenacity retry
+# Query prompts
+
+def _build_query_prompt(chunks: list[str], question: str, tier: str) -> str:
+    """
+    Build a focused question-answering prompt.
+    Tier controls depth of explanation, not what sections are retrieved.
+    """
+    context = "\n\n---\n\n".join(chunks)
+
+    if tier == "beginner":
+        return f"""You are answering a question about a research paper for someone \
+with no technical background. Use plain English and avoid jargon.
+
+Question: {question}
+
+Relevant excerpts from the paper:
+{context}
+
+Answer the question in 2-3 short paragraphs. If the answer isn't in the \
+excerpts, say so clearly — do not guess."""
+
+    if tier == "intermediate":
+        return f"""You are answering a question about a research paper for someone \
+with a university-level background but not a specialist.
+
+Question: {question}
+
+Relevant excerpts from the paper:
+{context}
+
+Answer with appropriate detail. Use Markdown formatting if helpful \
+(headers, bullet points). Include specific numbers or names from the text \
+where relevant. If the answer isn't in the excerpts, say so clearly."""
+
+    if tier == "expert":
+        return f"""You are answering a technical question about a research paper \
+for a domain expert. Be precise and comprehensive.
+
+Question: {question}
+
+Relevant excerpts from the paper:
+{context}
+
+Provide a thorough technical answer. Reference specific methods, metrics, and \
+details from the excerpts. Use Markdown formatting. If the information needed \
+to fully answer the question is not present in the excerpts, state what is \
+missing and answer as much as possible from what is available."""
+
+    raise ValueError(f"Unknown tier: {tier}")
+
+
+# ---------------------------------------------------------------------------
+# Async Groq call with retry
 
 async def _call_groq_async(model: str, prompt: str, max_tokens: int) -> str:
-    """
-    Async Groq call with exponential backoff retry on RateLimitError.
-    3 attempts, waits 5→30s between retries.
-    """
     client = _get_async_client()
-
     async for attempt in AsyncRetrying(
         retry=retry_if_exception_type(RateLimitError),
         stop=stop_after_attempt(3),
@@ -221,21 +267,13 @@ async def _call_groq_async(model: str, prompt: str, max_tokens: int) -> str:
                 temperature=0.3,
             )
             return response.choices[0].message.content or ""
-
-    return ""  # unreachable, satisfies type checker
+    return ""
 
 
 # ---------------------------------------------------------------------------
-# Expert map-reduce — fully concurrent
+# Expert map-reduce
 
 async def _expert_map_reduce(chunks: list[str]) -> str:
-    """
-    Map: summarize every chunk concurrently with asyncio.gather.
-    Reduce: synthesize all mini-summaries into one expert summary.
-
-    Sequential (v1): N chunks × ~5s each = N*5s
-    Concurrent (v2): all map calls fire at once → ~5s map + ~15s reduce = ~20s total
-    """
     async def _map_one(i: int, chunk: str) -> str:
         map_prompt = (
             f"Summarize the following section of a research paper in 3-5 technical sentences. "
@@ -249,12 +287,9 @@ async def _expert_map_reduce(chunks: list[str]) -> str:
         )
         return f"**Section {i + 1}:**\n{result}"
 
-    # All map calls fire simultaneously
     mini_summaries: list[str] = await asyncio.gather(
         *[_map_one(i, chunk) for i, chunk in enumerate(chunks)]
     )
-
-    # Reduce into full expert summary — uses the full 3500 token budget
     combined = "\n\n".join(mini_summaries)
     reduce_prompt = _build_prompt([combined], tier="expert")
     return await _call_groq_async(
@@ -265,28 +300,11 @@ async def _expert_map_reduce(chunks: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Public entry point (async)
+# Public: generate_summary (used by /summarize)
 
 async def generate_summary(chunks: list[str], tier: str) -> str:
-    """
-    Generate a summary for the given chunks at the specified tier.
-
-    Args:
-        chunks: List of text chunks from retriever.py
-        tier:   "beginner" | "intermediate" | "expert"
-
-    Returns:
-        Summary as a Markdown string.
-
-    Raises:
-        HTTPException(429) if Groq rate limit is hit after all retries.
-        HTTPException(500) if any other Groq error occurs.
-    """
     if not chunks:
-        return (
-            "_No content could be retrieved for this paper. "
-            "Try re-uploading the PDF._"
-        )
+        return "_No content could be retrieved for this paper. Try re-uploading the PDF._"
 
     model      = TIER_MODEL[tier]
     max_tokens = TIER_MAX_TOKENS[tier]
@@ -296,21 +314,48 @@ async def generate_summary(chunks: list[str], tier: str) -> str:
             return await _expert_map_reduce(chunks)
         else:
             prompt = _build_prompt(chunks, tier)
-            return await _call_groq_async(
-                model=model, prompt=prompt, max_tokens=max_tokens
-            )
+            return await _call_groq_async(model=model, prompt=prompt, max_tokens=max_tokens)
 
     except RateLimitError:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={
-                "error":       "rate_limited",
-                "detail":      "Groq rate limit hit. Please wait and retry.",
-                "retry_after": 30,
-            },
+            detail={"error": "rate_limited", "detail": "Groq rate limit hit. Please wait and retry.", "retry_after": 30},
         )
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"error": "llm_error", "detail": f"Groq call failed: {exc}"},
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Public: generate_query_answer (used by /query)
+
+async def generate_query_answer(chunks: list[str], question: str, tier: str) -> str:
+    """
+    Answer a specific question about a paper using retrieved chunks.
+    Single Groq call — no map-reduce needed for focused questions.
+    """
+    if not chunks:
+        return (
+            "_No relevant content found for your question in this paper. "
+            "Try rephrasing or asking about a different topic._"
+        )
+
+    model      = TIER_MODEL[tier]
+    max_tokens = QUERY_MAX_TOKENS[tier]
+
+    try:
+        prompt = _build_query_prompt(chunks, question, tier)
+        return await _call_groq_async(model=model, prompt=prompt, max_tokens=max_tokens)
+
+    except RateLimitError:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": "rate_limited", "detail": "Groq rate limit hit. Please wait and retry.", "retry_after": 30},
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "llm_error", "detail": f"Query failed: {exc}"},
         ) from exc
