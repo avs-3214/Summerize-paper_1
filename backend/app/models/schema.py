@@ -1,5 +1,9 @@
 """
 Pydantic v2 schemas — single source of truth for request/response shapes.
+
+Changes from v2:
+  - UploadResponse: added optional `warning` and `sections_found` fields
+    so callers (and frontends) can surface section-detection failures to users
 """
 
 from datetime import datetime
@@ -20,10 +24,14 @@ class PaperStatus(str, Enum):
 
 
 class UploadResponse(BaseModel):
-    paper_id:   str         = Field(..., json_schema_extra={"example": "3fa85f64-5717-4562-b3fc-2c963f66afa6"})
-    title:      str         = Field(..., json_schema_extra={"example": "Attention Is All You Need"})
-    num_chunks: int         = Field(..., ge=1, json_schema_extra={"example": 42})
-    status:     PaperStatus = Field(default=PaperStatus.ready)
+    paper_id:       str              = Field(..., json_schema_extra={"example": "3fa85f64-5717-4562-b3fc-2c963f66afa6"})
+    title:          str              = Field(..., json_schema_extra={"example": "Attention Is All You Need"})
+    num_chunks:     int              = Field(..., ge=1, json_schema_extra={"example": 42})
+    status:         PaperStatus      = Field(default=PaperStatus.ready)
+    # Optional — present when section detection partially or fully failed.
+    # Frontend should show a yellow warning banner when `warning` is not None.
+    warning:        str | None       = Field(default=None, json_schema_extra={"example": None})
+    sections_found: list[str] | None = Field(default=None, json_schema_extra={"example": ["abstract", "introduction", "results"]})
 
 
 class SummarizeRequest(BaseModel):
