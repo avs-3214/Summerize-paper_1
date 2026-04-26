@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app.routes import upload, summarize
+from app.routes import upload, summarize, validate
 
 
 class Settings(BaseSettings):
@@ -73,7 +73,7 @@ app.add_middleware(
 
 app.include_router(upload.router,    tags=["upload"])
 app.include_router(summarize.router, tags=["summarize"])
-
+app.include_router(validate.router, tags=["validate"])
 
 @app.get("/health", tags=["health"])
 async def health():
