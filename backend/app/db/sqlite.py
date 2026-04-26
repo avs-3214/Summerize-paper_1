@@ -1,7 +1,7 @@
 """
 SQLAlchemy + SQLite setup.
 
-Functions used by routes:
+Functions:
   - init_db()
   - store_paper_metadata()
   - get_paper()
@@ -11,10 +11,10 @@ Functions used by routes:
   - cache_validation()
 """
 
-import json                                                          # ← ADDED
+import json
 import os
 from datetime import datetime, timezone
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Float, Boolean  # ← Float, Boolean ADDED
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Float, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # ---------------------------------------------------------------------------
@@ -33,7 +33,7 @@ Base = declarative_base()
 
 
 # ---------------------------------------------------------------------------
-# Models — ALL classes must be defined BEFORE any function that uses them
+# Models — ALL classes defined before any function that uses them
 
 class Paper(Base):
     __tablename__ = "papers"
@@ -55,26 +55,23 @@ class Summary(Base):
     created_at       = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
-class ValidationScore(Base):                                         # ← ADDED — must be BEFORE the functions
+class ValidationScore(Base):
     __tablename__ = "validation_scores"
 
-    id            = Column(Integer, primary_key=True, autoincrement=True)
-    paper_id      = Column(String,  index=True, nullable=False)
-    tier          = Column(String,  nullable=False)
-    rouge1        = Column(Float,   nullable=False)
-    rouge2        = Column(Float,   nullable=False)
-    rougeL        = Column(Float,   nullable=False)
-    bertscore_f1  = Column(Float,   nullable=False)
-    thresholds    = Column(Text,    nullable=False)   # JSON blob
-    metric_pass   = Column(Text,    nullable=False)   # JSON blob
-    overall_valid = Column(Boolean, nullable=False)
-    verdict       = Column(Text,    nullable=False)
-    validated_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    id                   = Column(Integer, primary_key=True, autoincrement=True)
+    paper_id             = Column(String,  index=True, nullable=False)
+    tier                 = Column(String,  nullable=False)
+    bertscore_f1         = Column(Float,   nullable=False)   # vs abstract
+    fullpaper_similarity = Column(Float,   nullable=False)   # vs full paper (cosine)
+    thresholds           = Column(Text,    nullable=False)   # JSON blob
+    metric_pass          = Column(Text,    nullable=False)   # JSON blob
+    overall_valid        = Column(Boolean, nullable=False)
+    verdict              = Column(Text,    nullable=False)
+    validated_at         = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 # ---------------------------------------------------------------------------
-# init_db — called in main.py lifespan
-# picks up ALL 3 models above automatically
+# init_db — picks up ALL 3 models automatically
 
 def init_db():
     """Create all tables if they don't already exist."""
@@ -147,6 +144,10 @@ def cache_summary(paper_id: str, tier: str, summary_markdown: str, created_at: d
 # Validation cache CRUD
 
 def get_cached_validation(paper_id: str, tier: str) -> dict | None:
+    """
+    Retrieve cached validation scores for a paper+tier.
+    Returns dict matching ValidationResponse fields, or None if not cached.
+    """
     with SessionLocal() as db:
         row = (
             db.query(ValidationScore)
@@ -160,26 +161,27 @@ def get_cached_validation(paper_id: str, tier: str) -> dict | None:
             return None
 
         return {
-            "paper_id":      row.paper_id,
-            "tier":          row.tier,
-            "rouge1":        row.rouge1,
-            "rouge2":        row.rouge2,
-            "rougeL":        row.rougeL,
-            "bertscore_f1":  row.bertscore_f1,
-            "thresholds":    json.loads(row.thresholds),
-            "metric_pass":   json.loads(row.metric_pass),
-            "overall_valid": row.overall_valid,
-            "verdict":       row.verdict,
-            "validated_at":  row.validated_at,
+            "paper_id":             row.paper_id,
+            "tier":                 row.tier,
+            "bertscore_f1":         row.bertscore_f1,
+            "fullpaper_similarity": row.fullpaper_similarity,
+            "thresholds":           json.loads(row.thresholds),
+            "metric_pass":          json.loads(row.metric_pass),
+            "overall_valid":        row.overall_valid,
+            "verdict":              row.verdict,
+            "validated_at":         row.validated_at,
         }
 
 
 def cache_validation(
     paper_id: str,
     tier: str,
-    result,
+    result,               # ValidationResponse pydantic object
     validated_at: datetime,
 ) -> None:
+    """
+    Cache validation scores. Upsert pattern — same as cache_summary.
+    """
     with SessionLocal() as db:
         db.query(ValidationScore).filter(
             ValidationScore.paper_id == paper_id,
@@ -187,17 +189,15 @@ def cache_validation(
         ).delete()
 
         score = ValidationScore(
-            paper_id      = paper_id,
-            tier          = tier,
-            rouge1        = result.rouge1,
-            rouge2        = result.rouge2,
-            rougeL        = result.rougeL,
-            bertscore_f1  = result.bertscore_f1,
-            thresholds    = json.dumps(result.thresholds),
-            metric_pass   = json.dumps(result.metric_pass),
-            overall_valid = result.overall_valid,
-            verdict       = result.verdict,
-            validated_at  = validated_at,
+            paper_id             = paper_id,
+            tier                 = tier,
+            bertscore_f1         = result.bertscore_f1,
+            fullpaper_similarity = result.fullpaper_similarity,
+            thresholds           = json.dumps(result.thresholds),
+            metric_pass          = json.dumps(result.metric_pass),
+            overall_valid        = result.overall_valid,
+            verdict              = result.verdict,
+            validated_at         = validated_at,
         )
         db.add(score)
         db.commit()

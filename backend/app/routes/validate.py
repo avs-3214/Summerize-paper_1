@@ -1,21 +1,13 @@
 """
-POST /validate — validate a summary against the paper's abstract
-               using ROUGE and BERTScore.
+POST /validate — validate a summary using:
+  1. BERTScore F1     — semantic similarity vs abstract (author's intent)
+  2. Cosine Similarity — embedding similarity vs full paper (coverage)
 
-Flow:
-  1. Check if paper exists in SQLite
-  2. Check if summary is cached → if not, generate it first (calls Groq)
-  3. Extract abstract from the PDF via parser
-  4. Run ROUGE-1, ROUGE-2, ROUGE-L
-  5. Run BERTScore (F1)
-  6. Compute verdict (pass/fail per metric + overall)
-  7. Cache scores in SQLite
-  8. Return ValidationResponse
-
-Dependencies (add to requirements.txt):
-    rouge-score>=0.1.2
-    bert-score>=0.3.13
-    torch>=2.0.0          # bert-score needs torch
+No ROUGE. No new dependencies — uses your existing:
+  - bert-score       (BERTScore)
+  - bge-small-en-v1.5 via sentence-transformers  (CosineSim)
+  - ChromaDB         (chunk embeddings already stored)
+  - sklearn          (cosine_similarity)
 """
 
 # this is routes/validate.py
@@ -29,28 +21,22 @@ from app.models.schema import ValidationRequest, ValidationResponse, Tier
 router = APIRouter()
 
 # ---------------------------------------------------------------------------
-# Thresholds — tuned per tier
-# Beginner summaries are shorter/simpler → lower overlap expected
-# Expert summaries are dense/technical  → higher semantic bar
+# Thresholds per tier
+# BERTScore  — rescaled [0,1], measures semantic faithfulness to abstract
+# CosineSim  — [0,1], measures how well summary covers the full paper
 
 THRESHOLDS: dict[str, dict[str, float]] = {
     "beginner": {
-        "rouge1":    0.25,   # lower — beginner paraphrases heavily
-        "rouge2":    0.08,
-        "rougeL":    0.20,
-        "bertscore": 0.82,
+        "bertscore":  0.75,   # simplified language → slightly lower bar
+        "cosine_sim": 0.55,   # beginner covers fewer technical areas
     },
     "intermediate": {
-        "rouge1":    0.35,
-        "rouge2":    0.12,
-        "rougeL":    0.28,
-        "bertscore": 0.84,
+        "bertscore":  0.78,
+        "cosine_sim": 0.65,
     },
     "expert": {
-        "rouge1":    0.40,   # expert preserves more technical terms
-        "rouge2":    0.18,
-        "rougeL":    0.32,
-        "bertscore": 0.86,
+        "bertscore":  0.80,   # must be semantically faithful to abstract
+        "cosine_sim": 0.72,   # must cover the full paper well
     },
 }
 
@@ -62,12 +48,13 @@ THRESHOLDS: dict[str, dict[str, float]] = {
     "/validate",
     response_model=ValidationResponse,
     status_code=status.HTTP_200_OK,
-    summary="Validate a summary against the paper abstract",
+    summary="Validate a summary using BERTScore + Full Paper Cosine Similarity",
     description=(
-        "If a cached summary exists for the paper+tier, validates it immediately. "
-        "If not, generates the summary first (calling Groq), then validates. "
-        "Scores are cached in SQLite for future retrieval. "
-        "Reference text = abstract section extracted by the parser."
+        "Validates the summary for a given paper+tier using two metrics:\n"
+        "1. BERTScore F1 against the abstract — checks semantic faithfulness.\n"
+        "2. Cosine similarity against mean-pooled chunk embeddings — checks full paper coverage.\n\n"
+        "If no cached summary exists, generates one first (calls Groq). "
+        "Results are cached in SQLite."
     ),
     responses={
         404: {"description": "paper_id not found or abstract missing"},
@@ -107,7 +94,7 @@ async def validate_summary(body: ValidationRequest) -> ValidationResponse:
         )
 
     # ------------------------------------------------------------------
-    # 2. Return cached validation scores if available
+    # 2. Return cached validation if already done
     cached_val = get_cached_validation(paper_id=body.paper_id, tier=body.tier.value)
     if cached_val:
         return ValidationResponse(**cached_val)
@@ -119,7 +106,6 @@ async def validate_summary(body: ValidationRequest) -> ValidationResponse:
     if cached:
         summary_text = cached["summary_markdown"]
     else:
-        # Auto-generate then cache
         try:
             from app.services.retriever import retrieve_chunks
             from app.services.llm import generate_summary
@@ -136,7 +122,7 @@ async def validate_summary(body: ValidationRequest) -> ValidationResponse:
                     created_at=now,
                 )
             except Exception:
-                pass  # best-effort cache
+                pass
 
         except HTTPException:
             raise
@@ -150,55 +136,54 @@ async def validate_summary(body: ValidationRequest) -> ValidationResponse:
             ) from exc
 
     # ------------------------------------------------------------------
-    # 4. Extract abstract from PDF (reference text)
-    abstract_text = _get_abstract(paper)   # raises 404 if missing
+    # 4. Extract abstract → BERTScore reference
+    abstract_text = _get_abstract(paper)
 
     # ------------------------------------------------------------------
     # 5. Score
-    rouge_scores = _compute_rouge(
-        candidate=summary_text,
-        reference=abstract_text,
-    )
+
+    # Metric 1: BERTScore vs abstract
     bert_f1 = _compute_bertscore(
         candidate=summary_text,
         reference=abstract_text,
+    )
+
+    # Metric 2: Cosine similarity vs full paper (ChromaDB embeddings)
+    cosine_sim = _compute_fullpaper_similarity(
+        paper_id=body.paper_id,
+        summary=summary_text,
     )
 
     # ------------------------------------------------------------------
     # 6. Verdict
     thresholds = THRESHOLDS[body.tier.value]
     metric_pass = {
-        "rouge1":    rouge_scores["rouge1"]    >= thresholds["rouge1"],
-        "rouge2":    rouge_scores["rouge2"]    >= thresholds["rouge2"],
-        "rougeL":    rouge_scores["rougeL"]    >= thresholds["rougeL"],
-        "bertscore": bert_f1                   >= thresholds["bertscore"],
+        "bertscore":  bert_f1    >= thresholds["bertscore"],
+        "cosine_sim": cosine_sim >= thresholds["cosine_sim"],
     }
     overall_valid = all(metric_pass.values())
 
-    # Human-readable verdict message
-    verdict_msg = _build_verdict_message(
+    verdict = _build_verdict(
         tier=body.tier.value,
-        rouge_scores=rouge_scores,
         bert_f1=bert_f1,
+        cosine_sim=cosine_sim,
         metric_pass=metric_pass,
         overall_valid=overall_valid,
         thresholds=thresholds,
     )
 
     # ------------------------------------------------------------------
-    # 7. Cache validation result
+    # 7. Cache + return
     now = datetime.now(timezone.utc)
     result = ValidationResponse(
         paper_id=body.paper_id,
         tier=body.tier,
-        rouge1=round(rouge_scores["rouge1"], 4),
-        rouge2=round(rouge_scores["rouge2"], 4),
-        rougeL=round(rouge_scores["rougeL"], 4),
         bertscore_f1=round(bert_f1, 4),
+        fullpaper_similarity=round(cosine_sim, 4),
         thresholds=thresholds,
         metric_pass=metric_pass,
         overall_valid=overall_valid,
-        verdict=verdict_msg,
+        verdict=verdict,
         validated_at=now,
     )
 
@@ -210,7 +195,7 @@ async def validate_summary(body: ValidationRequest) -> ValidationResponse:
             validated_at=now,
         )
     except Exception:
-        pass  # best-effort
+        pass
 
     return result
 
@@ -220,10 +205,8 @@ async def validate_summary(body: ValidationRequest) -> ValidationResponse:
 
 def _get_abstract(paper: dict) -> str:
     """
-    Re-parse the PDF stored at paper['file_path'] and return the abstract text.
-    Falls back to first 1000 chars of full text if abstract section not found.
-
-    Raises HTTPException(404) if PDF is missing or completely unparseable.
+    Re-parse the PDF and return the abstract section text.
+    Falls back to first 1000 chars of full text if no abstract detected.
     """
     from pathlib import Path
 
@@ -233,27 +216,23 @@ def _get_abstract(paper: dict) -> str:
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
                 "error":  "pdf_not_found",
-                "detail": (
-                    f"PDF file not found at {file_path!r}. "
-                    "Cannot extract abstract for validation."
-                ),
+                "detail": f"PDF not found at {file_path!r}. Cannot extract abstract.",
             },
         )
 
     try:
         from app.services.parser import parse_pdf
 
-        parsed = parse_pdf(file_path)
+        parsed   = parse_pdf(file_path)
         sections = parsed.get("sections", [])
 
-        # Try to find the abstract section
         for section in sections:
             if section.get("name", "").lower() == "abstract":
                 abstract = section["text"].strip()
                 if abstract:
                     return abstract
 
-        # Fallback: no abstract section detected → use first 1000 chars of full text
+        # Fallback — no abstract section detected
         full_text = parsed.get("text", "").strip()
         if full_text:
             return full_text[:1000]
@@ -267,59 +246,25 @@ def _get_abstract(paper: dict) -> str:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
                 "error":  "parse_failed",
-                "detail": f"Could not extract abstract from PDF: {exc}",
+                "detail": f"Could not extract abstract: {exc}",
             },
         ) from exc
 
 
-def _compute_rouge(candidate: str, reference: str) -> dict[str, float]:
-    """
-    Compute ROUGE-1, ROUGE-2, ROUGE-L F1 scores.
-    Returns dict with keys: rouge1, rouge2, rougeL
-    """
-    try:
-        from rouge_score import rouge_scorer
-
-        scorer = rouge_scorer.RougeScorer(
-            ["rouge1", "rouge2", "rougeL"],
-            use_stemmer=True,   # 'summarise' == 'summarize', etc.
-        )
-        scores = scorer.score(target=reference, prediction=candidate)
-
-        return {
-            "rouge1": scores["rouge1"].fmeasure,
-            "rouge2": scores["rouge2"].fmeasure,
-            "rougeL": scores["rougeL"].fmeasure,
-        }
-
-    except ImportError:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "error":  "missing_dependency",
-                "detail": "rouge-score not installed. Run: pip install rouge-score",
-            },
-        )
-
-
 def _compute_bertscore(candidate: str, reference: str) -> float:
     """
-    Compute BERTScore F1 between candidate summary and reference (abstract).
-    Uses microsoft/deberta-xlarge-mnli model (best quality, ~900MB).
-    Falls back to roberta-large if deberta unavailable.
-
-    Returns F1 as a float.
+    BERTScore F1 — semantic similarity between summary and abstract.
+    Uses roberta-large (auto-selected for lang='en').
+    rescale_with_baseline=True → normalized to interpretable [0,1] range.
     """
     try:
         from bert_score import score as bert_score
 
-        # lang="en" auto-selects roberta-large for English
-        # rescale_with_baseline=True maps scores to [0,1] range — more interpretable
         P, R, F1 = bert_score(
             cands=[candidate],
             refs=[reference],
             lang="en",
-            rescale_with_baseline=True,
+            rescale_with_baseline=False,
             verbose=False,
         )
         return float(F1[0])
@@ -329,37 +274,91 @@ def _compute_bertscore(candidate: str, reference: str) -> float:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
                 "error":  "missing_dependency",
-                "detail": "bert-score not installed. Run: pip install bert-score",
+                "detail": "bert-score not installed. Run: pip install bert-score==0.3.13",
             },
         )
 
 
-def _build_verdict_message(
+def _compute_fullpaper_similarity(paper_id: str, summary: str) -> float:
+    """
+    Cosine similarity between the summary embedding and the
+    mean-pooled embeddings of ALL paper chunks stored in ChromaDB.
+
+    Why mean-pooling:
+      - BERTScore has a 512 token limit — can't handle full paper
+      - ChromaDB already has every chunk embedded with bge-small-en-v1.5
+      - Mean of all chunk vectors = single paper-level semantic vector
+      - No token limit, no new dependencies
+
+    Returns float in [0, 1].
+    """
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_similarity
+    from app.db.chroma import get_collection
+    from app.services.embeddings import embed_query
+
+    # Pull all chunk embeddings for this paper from ChromaDB
+    collection = get_collection()
+    results = collection.get(
+        where={"paper_id": {"$eq": paper_id}},
+        include=["embeddings"],
+    )
+
+    embeddings = results.get("embeddings")
+    if embeddings is None or len(embeddings) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error":  "no_embeddings",
+                "detail": f"No chunk embeddings found for paper {paper_id} in ChromaDB.",
+            },
+        )
+
+    # Mean-pool all chunk vectors → one paper-level vector (384-dim for bge-small)
+    paper_vec   = np.mean(embeddings, axis=0).reshape(1, -1)
+
+    # Embed the summary using the same bge-small model
+    summary_vec = np.array(embed_query(summary)).reshape(1, -1)
+
+    score = cosine_similarity(summary_vec, paper_vec)[0][0]
+    return float(score)
+
+
+def _build_verdict(
     tier: str,
-    rouge_scores: dict[str, float],
     bert_f1: float,
+    cosine_sim: float,
     metric_pass: dict[str, bool],
     overall_valid: bool,
     thresholds: dict[str, float],
 ) -> str:
-    """Build a human-readable verdict string for the response."""
+    """Human-readable verdict string."""
 
-    status_icon = "✅" if overall_valid else "❌"
-    verdict = f"{status_icon} Summary is {'VALID' if overall_valid else 'INVALID'} for tier: {tier.upper()}\n\n"
+    icon    = " " if overall_valid else " "
+    verdict = f"{icon} Summary is {'VALID' if overall_valid else 'INVALID'} for tier: {tier.upper()}\n\n"
 
     verdict += "**Metric Breakdown:**\n"
-    verdict += f"- ROUGE-1:    {rouge_scores['rouge1']:.4f}  (threshold ≥ {thresholds['rouge1']})  {'✅' if metric_pass['rouge1'] else '❌'}\n"
-    verdict += f"- ROUGE-2:    {rouge_scores['rouge2']:.4f}  (threshold ≥ {thresholds['rouge2']})  {'✅' if metric_pass['rouge2'] else '❌'}\n"
-    verdict += f"- ROUGE-L:    {rouge_scores['rougeL']:.4f}  (threshold ≥ {thresholds['rougeL']})  {'✅' if metric_pass['rougeL'] else '❌'}\n"
-    verdict += f"- BERTScore:  {bert_f1:.4f}  (threshold ≥ {thresholds['bertscore']})  {'✅' if metric_pass['bertscore'] else '❌'}\n"
+    verdict += (
+        f"- BERTScore F1       (vs abstract):   {bert_f1:.4f}  "
+        f"(threshold ≥ {thresholds['bertscore']})  "
+        f"{' ' if metric_pass['bertscore'] else ' '}\n"
+    )
+    verdict += (
+        f"- Cosine Similarity  (vs full paper): {cosine_sim:.4f}  "
+        f"(threshold ≥ {thresholds['cosine_sim']})  "
+        f"{' ' if metric_pass['cosine_sim'] else ' '}\n"
+    )
 
     failed = [k for k, v in metric_pass.items() if not v]
     if failed:
-        verdict += f"\n**Failed metrics:** {', '.join(failed)}\n"
-        verdict += (
-            "\nNote: Low ROUGE scores may indicate the summary paraphrases heavily "
-            "(acceptable for beginner tier). Low BERTScore indicates semantic drift — "
-            "the summary may be missing key concepts from the abstract."
-        )
+        verdict += f"\n**Failed:** {', '.join(failed)}\n"
+        if "bertscore" in failed:
+            verdict += (
+                "\n→ Low BERTScore: summary may be missing key concepts from the abstract."
+            )
+        if "cosine_sim" in failed:
+            verdict += (
+                "\n→ Low Cosine Similarity: summary may not cover the full paper well."
+            )
 
     return verdict
