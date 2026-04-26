@@ -64,7 +64,7 @@ async function apiGenerate(paperId, tier) {
 // Step 3 — GET /history  (last 5 uploaded papers with cached summaries)
 // Returns: { papers: [{ paper_id, title, num_chunks, uploaded_at, summaries }] }
 async function apiHistory() {
-  const res = await fetch(`${API_BASE}/history?limit=5`);
+  const res = await fetch(`${API_BASE}/history?limit=10`);
   if (!res.ok) return { papers: [] };  // fail silently — history is non-critical
   return res.json();
 }
@@ -158,7 +158,7 @@ export default function Vectara() {
         }
         return found;
       });
-      setHistory(entries.slice(0, 5));
+      setHistory(entries.slice(0, 10));
     });
   }, []);
 
