@@ -47,3 +47,42 @@ class ErrorResponse(BaseModel):
 class RateLimitErrorResponse(ErrorResponse):
     error:       str = Field(default="rate_limited")
     retry_after: int = Field(..., ge=1, json_schema_extra={"example": 30})
+
+
+# ---------------------------------------------------------------------------
+# Query
+
+class QueryRequest(BaseModel):
+    paper_id: str  = Field(..., json_schema_extra={"example": "3fa85f64-5717-4562-b3fc-2c963f66afa6"})
+    question: str  = Field(..., min_length=3, max_length=500, json_schema_extra={"example": "What dataset was used for training?"})
+    tier:     Tier = Field(default=Tier.intermediate, json_schema_extra={"example": "intermediate"})
+
+
+class QueryResponse(BaseModel):
+    paper_id:        str      = Field(..., json_schema_extra={"example": "3fa85f64-5717-4562-b3fc-2c963f66afa6"})
+    question:        str      = Field(..., json_schema_extra={"example": "What dataset was used for training?"})
+    tier:            Tier     = Field(..., json_schema_extra={"example": "intermediate"})
+    answer_markdown: str      = Field(..., json_schema_extra={"example": "The paper used the WMT 2014 dataset..."})
+    from_cache:      bool     = Field(..., json_schema_extra={"example": False})
+    created_at:      datetime = Field(..., json_schema_extra={"example": "2026-04-24T07:05:40Z"})
+
+
+# ---------------------------------------------------------------------------
+# History
+
+class PaperSummaries(BaseModel):
+    beginner:     str | None = None
+    intermediate: str | None = None
+    expert:       str | None = None
+
+
+class PaperHistoryItem(BaseModel):
+    paper_id:    str            = Field(..., json_schema_extra={"example": "3fa85f64-5717-4562-b3fc-2c963f66afa6"})
+    title:       str            = Field(..., json_schema_extra={"example": "Attention Is All You Need"})
+    num_chunks:  int            = Field(..., json_schema_extra={"example": 72})
+    uploaded_at: datetime       = Field(..., json_schema_extra={"example": "2026-04-24T07:05:40Z"})
+    summaries:   PaperSummaries = Field(default_factory=PaperSummaries)
+
+
+class HistoryResponse(BaseModel):
+    papers: list[PaperHistoryItem] = Field(default_factory=list)

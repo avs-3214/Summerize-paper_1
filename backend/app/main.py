@@ -7,11 +7,15 @@ Run from inside backend/ with:
 
 from contextlib import asynccontextmanager
 
+# Load .env into os.environ FIRST — before any service module reads os.getenv()
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app.routes import upload, summarize
+from app.routes import upload, summarize, history, query
 
 
 class Settings(BaseSettings):
@@ -53,7 +57,7 @@ app = FastAPI(
         "Ingest academic PDFs and generate beginner / intermediate / expert "
         "summaries via Groq (Llama 3.1 8B + Llama 3.3 70B)."
     ),
-    version="0.1.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -69,6 +73,8 @@ app.add_middleware(
 
 app.include_router(upload.router,    tags=["upload"])
 app.include_router(summarize.router, tags=["summarize"])
+app.include_router(history.router,   tags=["history"])
+app.include_router(query.router,     tags=["query"])
 
 
 @app.get("/health", tags=["health"])
