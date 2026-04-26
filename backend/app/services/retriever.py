@@ -60,6 +60,12 @@ def retrieve_chunks(paper_id: str, tier: str) -> list[str]:
     query_embedding = embed_query(query)
     collection      = get_collection()
 
+    # ------------------------------------------------------------------
+    # ChromaDB where filter
+    # Multiple conditions MUST use $and — top-level dict only allows
+    # a single field. Two fields at top level raises:
+    # "Expected where to have exactly one operator"
+
     if sections:
         where = {
             "$and": [
@@ -69,7 +75,7 @@ def retrieve_chunks(paper_id: str, tier: str) -> list[str]:
         }
     else:
         where = {"paper_id": {"$eq": paper_id}}
-
+ 
     results = collection.query(
         query_embeddings=[query_embedding],
         n_results=n_candidates,
@@ -78,8 +84,9 @@ def retrieve_chunks(paper_id: str, tier: str) -> list[str]:
     )
     candidates: list[str] = results["documents"][0] if results["documents"] else []
 
-    # Fallback: section filter returned nothing
     if not candidates and sections:
+        # Section filter may have returned nothing (e.g. parser found no abstract)
+        # Fall back to unfiltered query
         results = collection.query(
             query_embeddings=[query_embedding],
             n_results=n_candidates,
@@ -91,7 +98,8 @@ def retrieve_chunks(paper_id: str, tier: str) -> list[str]:
     if not candidates:
         return []
 
-    return _rerank(query=query, candidates=candidates, top_k=top_k)
+    # Rerank with cross-encoder
+    return _rerank(query=query, candidates=candidates, top_k=top_k) 
 
 
 # ---------------------------------------------------------------------------
