@@ -72,6 +72,17 @@ async function apiQuery(paperId, question, tier) {
   return res.json();
 }
 
+// POST /validate — validate summary accuracy (BERTScore + cosine similarity)
+async function apiValidate(paperId, tier) {
+  const res = await fetch(`${API_BASE}/validate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ paper_id: paperId, tier }),
+  });
+  if (!res.ok) throw { response: { status: res.status, data: await res.json().catch(() => ({})) } };
+  return res.json();
+}
+
 // ── Tiers ─────────────────────────────────────────────────────────────────────
 const TIERS = [
   { id: "beginner",     label: "Beginner",     dot: "#2d7a4f", desc: "Plain-language overview" },
@@ -124,6 +135,130 @@ function Spinner() {
   );
 }
 
+// ── Validation Panel component ────────────────────────────────────────────────
+function ValidationPanel({ data, loading, error, onDismiss }) {
+  if (!loading && !data && !error) return null;
+
+  const barColor = (pass) => pass ? "#2d7a4f" : "#b04a2a";
+  const pct = (val) => Math.round(val * 100);
+
+  return (
+    <div style={{
+      marginTop: 16,
+      background: "#ede8dc",
+      border: `1px solid ${data ? (data.overall_valid ? "rgba(45,122,79,.3)" : "rgba(176,74,42,.3)") : "rgba(0,0,0,.09)"}`,
+      borderRadius: 14, padding: "16px 18px",
+      animation: "fadeUp .3s ease",
+    }}>
+      {/* Header row */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: "#1a1714", fontFamily: "Space Grotesk, sans-serif" }}>
+            Accuracy Score
+          </span>
+          {data && (
+            <span style={{
+              fontSize: 11, padding: "2px 8px", borderRadius: 20,
+              background: data.overall_valid ? "rgba(45,122,79,.1)" : "rgba(176,74,42,.1)",
+              color: data.overall_valid ? "#2d7a4f" : "#b04a2a",
+              fontFamily: "JetBrains Mono, monospace",
+            }}>
+              {data.overall_valid ? "✓ Valid" : "✗ Below threshold"}
+            </span>
+          )}
+          {loading && (
+            <span style={{ fontSize: 11, color: "#9a9183", fontFamily: "JetBrains Mono, monospace" }}>
+              Running BERTScore…
+            </span>
+          )}
+        </div>
+        <button onClick={onDismiss} style={{
+          background: "none", border: "none", color: "#9a9183",
+          cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 2px",
+        }}>×</button>
+      </div>
+
+      {/* Loading state */}
+      {loading && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 0" }}>
+          <div style={{
+            width: 14, height: 14, borderRadius: "50%",
+            border: "2px solid rgba(0,0,0,.1)", borderTopColor: "#6b4f2a",
+            animation: "spin .7s linear infinite", flexShrink: 0,
+          }} />
+          <span style={{ fontSize: 12, color: "#6b6456", fontFamily: "JetBrains Mono, monospace" }}>
+            This may take ~15s on first run (BERTScore model loading)…
+          </span>
+        </div>
+      )}
+
+      {/* Error state */}
+      {error && (
+        <div style={{ fontSize: 12, color: "#b04a2a", fontFamily: "JetBrains Mono, monospace", padding: "4px 0" }}>
+          {error}
+        </div>
+      )}
+
+      {/* Results */}
+      {data && !loading && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {/* Metric 1: BERTScore */}
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+              <span style={{ fontSize: 12, color: "#2e2b26", fontFamily: "Space Grotesk, sans-serif" }}>
+                BERTScore F1 <span style={{ color: "#9a9183", fontSize: 11 }}>(vs abstract)</span>
+              </span>
+              <span style={{ fontSize: 12, fontFamily: "JetBrains Mono, monospace", color: barColor(data.metric_pass.bertscore), fontWeight: 600 }}>
+                {(data.bertscore_f1 * 100).toFixed(1)}% {data.metric_pass.bertscore ? "✓" : "✗"}
+              </span>
+            </div>
+            <div style={{ height: 6, borderRadius: 3, background: "rgba(0,0,0,.08)", overflow: "hidden" }}>
+              <div style={{
+                height: "100%", borderRadius: 3,
+                width: `${Math.min(pct(data.bertscore_f1), 100)}%`,
+                background: barColor(data.metric_pass.bertscore),
+                transition: "width .6s ease",
+              }} />
+            </div>
+            <div style={{ fontSize: 10, color: "#9a9183", fontFamily: "JetBrains Mono, monospace", marginTop: 3 }}>
+              threshold ≥ {(data.thresholds.bertscore * 100).toFixed(0)}%
+            </div>
+          </div>
+
+          {/* Metric 2: Cosine Similarity */}
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+              <span style={{ fontSize: 12, color: "#2e2b26", fontFamily: "Space Grotesk, sans-serif" }}>
+                Coverage Score <span style={{ color: "#9a9183", fontSize: 11 }}>(max-pooled, vs paper chunks)</span>
+              </span>
+              <span style={{ fontSize: 12, fontFamily: "JetBrains Mono, monospace", color: barColor(data.metric_pass.cosine_sim), fontWeight: 600 }}>
+                {(data.fullpaper_similarity * 100).toFixed(1)}% {data.metric_pass.cosine_sim ? "✓" : "✗"}
+              </span>
+            </div>
+            <div style={{ height: 6, borderRadius: 3, background: "rgba(0,0,0,.08)", overflow: "hidden" }}>
+              <div style={{
+                height: "100%", borderRadius: 3,
+                width: `${Math.min(pct(data.fullpaper_similarity), 100)}%`,
+                background: barColor(data.metric_pass.cosine_sim),
+                transition: "width .6s ease",
+              }} />
+            </div>
+            <div style={{ fontSize: 10, color: "#9a9183", fontFamily: "JetBrains Mono, monospace", marginTop: 3 }}>
+              threshold ≥ {(data.thresholds.cosine_sim * 100).toFixed(0)}%
+            </div>
+          </div>
+
+          {/* Validated at */}
+          <div style={{ fontSize: 10, color: "#b0a898", fontFamily: "JetBrains Mono, monospace", marginTop: 2 }}>
+            validated {new Date(data.validated_at).toLocaleString()}
+            {data.from_cache && " · cached"}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 export default function Vectara() {
   useEffect(() => { injectFonts(); }, []);
@@ -170,6 +305,10 @@ export default function Vectara() {
   const [mode, setMode]               = useState("summarize");
   const [question, setQuestion]       = useState("");
   const [queryResult, setQueryResult] = useState(null);
+
+  const [validation, setValidation]         = useState(null);   // ValidationResponse from /validate
+  const [validationLoading, setValidationLoading] = useState(false);
+  const [validationError, setValidationError]     = useState(null);
 
   const [history, setHistory]     = useState([]);
   const [activeIdx, setActiveIdx] = useState(null);
@@ -230,6 +369,8 @@ export default function Vectara() {
       }
       setSummary(res);
       setQueryResult(null);
+      setValidation(null);
+      setValidationError(null);
       const entry = { doc: uploadedDoc, tier: selectedTier, summary: res };
       setHistory(prev => { const next = [entry, ...prev]; setActiveIdx(0); return next; });
       setStage("done");
@@ -285,6 +426,23 @@ export default function Vectara() {
   };
 
   // ── Reset ─────────────────────────────────────────────────────────────────────
+  // ── Validate summary accuracy ───────────────────────────────────────────────
+  const handleValidate = async () => {
+    if (!uploadedDoc || !summary) return;
+    setValidationLoading(true);
+    setValidationError(null);
+    setValidation(null);
+    try {
+      const res = await apiValidate(uploadedDoc.paper_id, selectedTier);
+      setValidation(res);
+    } catch (err) {
+      const e = parseApiError(err);
+      setValidationError(`Validation failed: ${e.detail}`);
+    } finally {
+      setValidationLoading(false);
+    }
+  };
+
   const resetToIdle = () => {
     setStage("idle");
     setUploadedDoc(null);
@@ -293,6 +451,8 @@ export default function Vectara() {
     setQuestion("");
     setMode("summarize");
     setProcessingMsg("");
+    setValidation(null);
+    setValidationError(null);
   };
 
   const isWorking      = stage === "uploading" || stage === "summarising";
@@ -643,6 +803,32 @@ export default function Vectara() {
                   {queryResult ? queryResult.answer_markdown : summary?.summary_markdown}
                 </ReactMarkdown>
               </div>
+
+              {/* Validate button — only for summaries, not query results */}
+              {summary && !queryResult && (
+                <div style={{ marginTop: 12 }}>
+                  {!validation && !validationLoading && !validationError && (
+                    <button onClick={handleValidate} style={{
+                      padding: "8px 16px", borderRadius: 10,
+                      border: "1px solid rgba(107,79,42,.3)",
+                      background: "transparent", color: "#6b4f2a", fontSize: 12,
+                      cursor: "pointer", fontFamily: "Space Grotesk, sans-serif",
+                      transition: "all .15s", display: "flex", alignItems: "center", gap: 6,
+                    }}
+                      onMouseEnter={e => e.currentTarget.style.background = "rgba(107,79,42,.06)"}
+                      onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+                    >
+                      <span>⟳</span> Check Accuracy
+                    </button>
+                  )}
+                  <ValidationPanel
+                    data={validation}
+                    loading={validationLoading}
+                    error={validationError}
+                    onDismiss={() => { setValidation(null); setValidationError(null); }}
+                  />
+                </div>
+              )}
 
               {/* Footer */}
               <div style={{ marginTop: 16, display: "flex", gap: 10, flexWrap: "wrap" }}>

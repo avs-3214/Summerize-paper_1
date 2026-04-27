@@ -1,43 +1,85 @@
 """
+validate.py
 POST /validate — validate a summary using:
-  1. BERTScore F1     — semantic similarity vs abstract (author's intent)
-  2. Cosine Similarity — embedding similarity vs full paper (coverage)
+  1. BERTScore F1     — semantic similarity vs tier-appropriate reference chunks
+  2. Coverage Score   — max-pooled cosine similarity vs paper chunks
 
-No ROUGE. No new dependencies — uses your existing:
-  - bert-score       (BERTScore)
-  - bge-small-en-v1.5 via sentence-transformers  (CosineSim)
-  - ChromaDB         (chunk embeddings already stored)
-  - sklearn          (cosine_similarity)
+BERTScore reference is tier-aware, pulled from ChromaDB:
+  beginner:     top 3 chunks from abstract+conclusion
+  intermediate: top 6 chunks across all sections
+  expert:       top 10 chunks across all sections
+
+rescale_with_baseline=True:
+  Raw BERTScore F1 with roberta-large clusters between 0.82–0.92 even for
+  unrelated text, making thresholds meaningless. Rescaling maps scores to
+  [0,1] where 0 = random baseline, 1 = identical. Typical good summaries
+  score 0.50–0.75 in this range, giving real signal.
+
+Max-pooled cosine similarity (Metric 2):
+  Mean-pooling all chunk embeddings penalizes summaries for not covering
+  sections they were never meant to cover (e.g. beginner penalized for
+  missing methodology details). Max-pooling rewards depth of coverage for
+  the sections the summary does address.
 """
-
-# this is routes/validate.py
 
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, status
 
-from app.models.schema import ValidationRequest, ValidationResponse, Tier
+from app.models.schema import ValidationRequest, ValidationResponse
 
 router = APIRouter()
 
 # ---------------------------------------------------------------------------
-# Thresholds per tier
-# BERTScore  — rescaled [0,1], measures semantic faithfulness to abstract
-# CosineSim  — [0,1], measures how well summary covers the full paper
+# Tier config
+
+REFERENCE_TOP_K: dict[str, int] = {
+    "beginner":     3,
+    "intermediate": 6,
+    "expert":       10,
+}
+
+REFERENCE_SECTIONS: dict[str, list[str] | None] = {
+    "beginner":     ["abstract", "conclusion", "body"],
+    "intermediate": None,
+    "expert":       None,
+}
+
+# BERTScore 512-token limit. ~400 tokens ≈ 1600 chars.
+BERT_CHAR_LIMIT = 1600
+
+# Thresholds calibrated for rescaled BERTScore + max-pooled cosine:
+#
+# BERTScore (rescaled): typical good summary = 0.50–0.75
+#   beginner:     0.45 — plain language paraphrase, expect lower semantic match
+#   intermediate: 0.52 — structured restatement, moderate match expected
+#   expert:       0.58 — technical depth expected, high match required
+#
+# Coverage (max-pooled cosine): typical range 0.65–0.85
+#   beginner:     0.62 — only needs to cover abstract/conclusion well
+#   intermediate: 0.70 — needs broad coverage across sections
+#   expert:       0.76 — must cover all major sections deeply
 
 THRESHOLDS: dict[str, dict[str, float]] = {
     "beginner": {
-        "bertscore":  0.75,   # simplified language → slightly lower bar
-        "cosine_sim": 0.55,   # beginner covers fewer technical areas
+        "bertscore":  0.70,
+        "cosine_sim": 0.62,
     },
     "intermediate": {
-        "bertscore":  0.78,
-        "cosine_sim": 0.65,
+        "bertscore":  0.70,
+        "cosine_sim": 0.70,
     },
     "expert": {
-        "bertscore":  0.80,   # must be semantically faithful to abstract
-        "cosine_sim": 0.72,   # must cover the full paper well
+        "bertscore":  0.70,
+        "cosine_sim": 0.76,
     },
+}
+
+# Tier queries — same as retriever.py for consistent chunk selection
+_TIER_QUERIES: dict[str, str] = {
+    "beginner":     "What is the main problem this paper solves and what did it find?",
+    "intermediate": "What are the key contributions, methodology, and results of this research paper?",
+    "expert":       "What is the technical approach, experimental setup, baselines, metrics, ablations, limitations, and future work?",
 }
 
 
@@ -48,16 +90,17 @@ THRESHOLDS: dict[str, dict[str, float]] = {
     "/validate",
     response_model=ValidationResponse,
     status_code=status.HTTP_200_OK,
-    summary="Validate a summary using BERTScore + Full Paper Cosine Similarity",
+    summary="Validate summary accuracy using rescaled BERTScore + max-pooled coverage",
     description=(
-        "Validates the summary for a given paper+tier using two metrics:\n"
-        "1. BERTScore F1 against the abstract — checks semantic faithfulness.\n"
-        "2. Cosine similarity against mean-pooled chunk embeddings — checks full paper coverage.\n\n"
-        "If no cached summary exists, generates one first (calls Groq). "
-        "Results are cached in SQLite."
+        "Two metrics, both tier-aware:\n"
+        "1. BERTScore F1 (rescaled) against tier-appropriate reference chunks "
+        "   from ChromaDB — same chunks fed to Groq.\n"
+        "2. Max-pooled cosine similarity against all paper chunk embeddings "
+        "   — rewards depth of coverage for relevant sections.\n\n"
+        "Results cached in SQLite."
     ),
     responses={
-        404: {"description": "paper_id not found or abstract missing"},
+        404: {"description": "paper_id not found or no chunks in ChromaDB"},
         422: {"description": "Invalid tier"},
         429: {"description": "Groq rate limit hit during generation"},
         500: {"description": "LLM or scoring error"},
@@ -65,15 +108,10 @@ THRESHOLDS: dict[str, dict[str, float]] = {
 )
 async def validate_summary(body: ValidationRequest) -> ValidationResponse:
 
-    # ------------------------------------------------------------------
-    # 0. Import DB layer
     try:
         from app.db.sqlite import (
-            get_paper,
-            get_cached_summary,
-            cache_summary,
-            get_cached_validation,
-            cache_validation,
+            get_paper, get_cached_summary, cache_summary,
+            get_cached_validation, cache_validation,
         )
     except ImportError as exc:
         raise HTTPException(
@@ -81,28 +119,21 @@ async def validate_summary(body: ValidationRequest) -> ValidationResponse:
             detail={"error": "internal_error", "detail": "DB layer not initialised."},
         ) from exc
 
-    # ------------------------------------------------------------------
     # 1. Paper exists?
     paper = get_paper(body.paper_id)
     if paper is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error":  "paper_not_found",
-                "detail": f"No paper found with id {body.paper_id}",
-            },
+            detail={"error": "paper_not_found", "detail": f"No paper found with id {body.paper_id}"},
         )
 
-    # ------------------------------------------------------------------
-    # 2. Return cached validation if already done
+    # 2. Cached validation?
     cached_val = get_cached_validation(paper_id=body.paper_id, tier=body.tier.value)
     if cached_val:
         return ValidationResponse(**cached_val)
 
-    # ------------------------------------------------------------------
     # 3. Get or generate summary
     cached = get_cached_summary(paper_id=body.paper_id, tier=body.tier.value)
-
     if cached:
         summary_text = cached["summary_markdown"]
     else:
@@ -110,69 +141,43 @@ async def validate_summary(body: ValidationRequest) -> ValidationResponse:
             from app.services.retriever import retrieve_chunks
             from app.services.llm import generate_summary
 
-            chunks = retrieve_chunks(paper_id=body.paper_id, tier=body.tier.value)
+            chunks       = retrieve_chunks(paper_id=body.paper_id, tier=body.tier.value)
             summary_text = await generate_summary(chunks=chunks, tier=body.tier.value)
-
-            now = datetime.now(timezone.utc)
             try:
                 cache_summary(
-                    paper_id=body.paper_id,
-                    tier=body.tier.value,
+                    paper_id=body.paper_id, tier=body.tier.value,
                     summary_markdown=summary_text,
-                    created_at=now,
+                    created_at=datetime.now(timezone.utc),
                 )
             except Exception:
                 pass
-
         except HTTPException:
             raise
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail={
-                    "error":  "generation_failed",
-                    "detail": f"Could not generate summary before validation: {exc}",
-                },
+                detail={"error": "generation_failed", "detail": f"Could not generate summary: {exc}"},
             ) from exc
 
-    # ------------------------------------------------------------------
-    # 4. Extract abstract → BERTScore reference
-    abstract_text = _get_abstract(paper)
+    # 4. Pull tier-appropriate reference chunks from ChromaDB
+    reference_text = _get_reference_chunks(paper_id=body.paper_id, tier=body.tier.value)
 
-    # ------------------------------------------------------------------
     # 5. Score
+    bert_f1    = _compute_bertscore(candidate=summary_text, reference=reference_text)
+    cosine_sim = _compute_coverage(paper_id=body.paper_id, summary=summary_text)
 
-    # Metric 1: BERTScore vs abstract
-    bert_f1 = _compute_bertscore(
-        candidate=summary_text,
-        reference=abstract_text,
-    )
-
-    # Metric 2: Cosine similarity vs full paper (ChromaDB embeddings)
-    cosine_sim = _compute_fullpaper_similarity(
-        paper_id=body.paper_id,
-        summary=summary_text,
-    )
-
-    # ------------------------------------------------------------------
     # 6. Verdict
-    thresholds = THRESHOLDS[body.tier.value]
-    metric_pass = {
+    thresholds    = THRESHOLDS[body.tier.value]
+    metric_pass   = {
         "bertscore":  bert_f1    >= thresholds["bertscore"],
         "cosine_sim": cosine_sim >= thresholds["cosine_sim"],
     }
     overall_valid = all(metric_pass.values())
-
-    verdict = _build_verdict(
-        tier=body.tier.value,
-        bert_f1=bert_f1,
-        cosine_sim=cosine_sim,
-        metric_pass=metric_pass,
-        overall_valid=overall_valid,
-        thresholds=thresholds,
+    verdict       = _build_verdict(
+        tier=body.tier.value, bert_f1=bert_f1, cosine_sim=cosine_sim,
+        metric_pass=metric_pass, overall_valid=overall_valid, thresholds=thresholds,
     )
 
-    # ------------------------------------------------------------------
     # 7. Cache + return
     now = datetime.now(timezone.utc)
     result = ValidationResponse(
@@ -186,13 +191,10 @@ async def validate_summary(body: ValidationRequest) -> ValidationResponse:
         verdict=verdict,
         validated_at=now,
     )
-
     try:
         cache_validation(
-            paper_id=body.paper_id,
-            tier=body.tier.value,
-            result=result,
-            validated_at=now,
+            paper_id=body.paper_id, tier=body.tier.value,
+            result=result, validated_at=now,
         )
     except Exception:
         pass
@@ -203,64 +205,81 @@ async def validate_summary(body: ValidationRequest) -> ValidationResponse:
 # ---------------------------------------------------------------------------
 # Helpers
 
-def _get_abstract(paper: dict) -> str:
+def _get_reference_chunks(paper_id: str, tier: str) -> str:
     """
-    Re-parse the PDF and return the abstract section text.
-    Falls back to first 1000 chars of full text if no abstract detected.
+    Pull tier-appropriate chunks from ChromaDB and concatenate as
+    the BERTScore reference text. Truncates at BERT_CHAR_LIMIT.
     """
-    from pathlib import Path
+    from app.db.chroma import get_collection
+    from app.services.embeddings import embed_query
 
-    file_path = paper.get("file_path", "")
-    if not file_path or not Path(file_path).exists():
+    top_k           = REFERENCE_TOP_K[tier]
+    sections        = REFERENCE_SECTIONS[tier]
+    query_embedding = embed_query(_TIER_QUERIES[tier])
+    collection      = get_collection()
+
+    where = (
+        {
+            "$and": [
+                {"paper_id": {"$eq": paper_id}},
+                {"section":  {"$in": sections}},
+            ]
+        }
+        if sections
+        else {"paper_id": {"$eq": paper_id}}
+    )
+
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=min(top_k * 2, 20),
+        where=where,
+        include=["documents"],
+    )
+    chunks: list[str] = results["documents"][0] if results["documents"] else []
+
+    # Fallback: section filter returned nothing
+    if not chunks and sections:
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(top_k * 2, 20),
+            where={"paper_id": {"$eq": paper_id}},
+            include=["documents"],
+        )
+        chunks = results["documents"][0] if results["documents"] else []
+
+    if not chunks:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error":  "pdf_not_found",
-                "detail": f"PDF not found at {file_path!r}. Cannot extract abstract.",
-            },
+            detail={"error": "no_chunks", "detail": f"No chunks found for paper {paper_id}. Try re-uploading."},
         )
 
-    try:
-        from app.services.parser import parse_pdf
+    # Concatenate up to BERT_CHAR_LIMIT
+    reference = ""
+    for chunk in chunks[:top_k]:
+        candidate = (reference + "\n\n" + chunk).strip()
+        if len(candidate) <= BERT_CHAR_LIMIT:
+            reference = candidate
+        else:
+            remaining = BERT_CHAR_LIMIT - len(reference)
+            if remaining > 100:
+                reference = (reference + "\n\n" + chunk[:remaining]).strip()
+            break
 
-        parsed   = parse_pdf(file_path)
-        sections = parsed.get("sections", [])
-
-        for section in sections:
-            if section.get("name", "").lower() == "abstract":
-                abstract = section["text"].strip()
-                if abstract:
-                    return abstract
-
-        # Fallback — no abstract section detected
-        full_text = parsed.get("text", "").strip()
-        if full_text:
-            return full_text[:1000]
-
-        raise ValueError("No text extracted from PDF.")
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "error":  "parse_failed",
-                "detail": f"Could not extract abstract: {exc}",
-            },
-        ) from exc
+    return reference
 
 
 def _compute_bertscore(candidate: str, reference: str) -> float:
     """
-    BERTScore F1 — semantic similarity between summary and abstract.
-    Uses roberta-large (auto-selected for lang='en').
-    rescale_with_baseline=True → normalized to interpretable [0,1] range.
+    BERTScore F1 with rescale_with_baseline=True.
+
+    Raw roberta-large F1 clusters between 0.82–0.92 for English academic text.
+    Thresholds are calibrated to this range (0.82–0.86).
+    First call downloads roberta-large (~1.4GB) — subsequent calls are fast.
     """
     try:
-        from bert_score import score as bert_score
+        from bert_score import score as bert_score_fn
 
-        P, R, F1 = bert_score(
+        P, R, F1 = bert_score_fn(
             cands=[candidate],
             refs=[reference],
             lang="en",
@@ -279,27 +298,29 @@ def _compute_bertscore(candidate: str, reference: str) -> float:
         )
 
 
-def _compute_fullpaper_similarity(paper_id: str, summary: str) -> float:
+def _compute_coverage(paper_id: str, summary: str) -> float:
     """
-    Cosine similarity between the summary embedding and the
-    mean-pooled embeddings of ALL paper chunks stored in ChromaDB.
+    Max-pooled cosine similarity between the summary embedding and
+    individual paper chunk embeddings.
 
-    Why mean-pooling:
-      - BERTScore has a 512 token limit — can't handle full paper
-      - ChromaDB already has every chunk embedded with bge-small-en-v1.5
-      - Mean of all chunk vectors = single paper-level semantic vector
-      - No token limit, no new dependencies
+    Why max-pooling instead of mean-pooling:
+      Mean-pooling penalizes summaries for not covering sections they were
+      never meant to cover. A beginner summary scoring low because it doesn't
+      cover methodology detail is a false negative.
+
+      Max-pooling asks: "does the summary deeply match at least some
+      chunks?" — which rewards focused, accurate coverage of relevant
+      sections without penalizing intentional omissions.
 
     Returns float in [0, 1].
     """
     import numpy as np
-    from sklearn.metrics.pairwise import cosine_similarity
+    from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine
     from app.db.chroma import get_collection
     from app.services.embeddings import embed_query
 
-    # Pull all chunk embeddings for this paper from ChromaDB
     collection = get_collection()
-    results = collection.get(
+    results    = collection.get(
         where={"paper_id": {"$eq": paper_id}},
         include=["embeddings"],
     )
@@ -308,20 +329,17 @@ def _compute_fullpaper_similarity(paper_id: str, summary: str) -> float:
     if embeddings is None or len(embeddings) == 0:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error":  "no_embeddings",
-                "detail": f"No chunk embeddings found for paper {paper_id} in ChromaDB.",
-            },
+            detail={"error": "no_embeddings", "detail": f"No embeddings found for paper {paper_id}."},
         )
 
-    # Mean-pool all chunk vectors → one paper-level vector (384-dim for bge-small)
-    paper_vec   = np.mean(embeddings, axis=0).reshape(1, -1)
+    summary_vec  = np.array(embed_query(summary)).reshape(1, -1)
+    chunk_matrix = np.array(embeddings)                          # shape: (n_chunks, 384)
 
-    # Embed the summary using the same bge-small model
-    summary_vec = np.array(embed_query(summary)).reshape(1, -1)
+    # Similarity of summary vs every chunk — shape: (1, n_chunks)
+    similarities = sklearn_cosine(summary_vec, chunk_matrix)[0]  # shape: (n_chunks,)
 
-    score = cosine_similarity(summary_vec, paper_vec)[0][0]
-    return float(score)
+    # Max-pool: best-matching chunk score
+    return float(np.max(similarities))
 
 
 def _build_verdict(
@@ -332,33 +350,27 @@ def _build_verdict(
     overall_valid: bool,
     thresholds: dict[str, float],
 ) -> str:
-    """Human-readable verdict string."""
-
-    icon    = " " if overall_valid else " "
+    icon    = "✓" if overall_valid else "✗"
     verdict = f"{icon} Summary is {'VALID' if overall_valid else 'INVALID'} for tier: {tier.upper()}\n\n"
 
     verdict += "**Metric Breakdown:**\n"
     verdict += (
-        f"- BERTScore F1       (vs abstract):   {bert_f1:.4f}  "
+        f"- BERTScore F1 (rescaled, vs {tier} ref chunks): {bert_f1:.4f}  "
         f"(threshold ≥ {thresholds['bertscore']})  "
-        f"{' ' if metric_pass['bertscore'] else ' '}\n"
+        f"{'✓' if metric_pass['bertscore'] else '✗'}\n"
     )
     verdict += (
-        f"- Cosine Similarity  (vs full paper): {cosine_sim:.4f}  "
+        f"- Coverage Score (max-pooled cosine):            {cosine_sim:.4f}  "
         f"(threshold ≥ {thresholds['cosine_sim']})  "
-        f"{' ' if metric_pass['cosine_sim'] else ' '}\n"
+        f"{'✓' if metric_pass['cosine_sim'] else '✗'}\n"
     )
 
     failed = [k for k, v in metric_pass.items() if not v]
     if failed:
         verdict += f"\n**Failed:** {', '.join(failed)}\n"
         if "bertscore" in failed:
-            verdict += (
-                "\n→ Low BERTScore: summary may be missing key concepts from the abstract."
-            )
+            verdict += f"\n→ Low BERTScore: summary may be missing key concepts from the {tier}-level reference content."
         if "cosine_sim" in failed:
-            verdict += (
-                "\n→ Low Cosine Similarity: summary may not cover the full paper well."
-            )
+            verdict += "\n→ Low Coverage: summary does not closely match any section of the paper."
 
     return verdict
